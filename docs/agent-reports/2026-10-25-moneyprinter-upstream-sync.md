@@ -43,3 +43,19 @@ WebUI check, final source commit, fast-forward current installation, compatible 
 - WebUI logging AppTest initially timed out on GitHub API rate limiting; isolated test now stubs external release polling and uses a Windows-appropriate timeout. Retest: 1 passed in 13.10s, exit 0.
 - Testing produced 2 temporary m4s segments, retained in the chat archive for traceability.
 - Source promotion and runtime verification are separate from the above passing tests.
+
+## Final verification | 2026-10-26 00:08 Africa/Johannesburg
+- Source merge commit: 3c6ae3a1f72ffeb3295994c08327554de527b693, with parents 7aa384a (fork) and 40d7f3d (upstream); pushed to fork main without force.
+- Local canonical main fast-forwarded to merge commit; untracked diagnostic files, private config.toml, storage and untracked CHANGELOG.md retained.
+- Verified upstream main live still equals 40d7f3de9d8e14056c72f523ecbb6700cff50372.
+- Current canonical Python dependencies installed successfully with uv sync --frozen --python 3.11 --group dev; mpt --version returned 1.3.9 (exit 0).
+- Existing Python venv safely backed up to D:\dev\MoneyPrinterTurbo\.venv-before-upstream-20261026-0001.
+- WebUI smoke: HTTP 200 at 127.0.0.1:18852/_stcore/health; test server then stopped (exit 0). No public exposure.
+- FastAPI OpenAPI-import smoke timed out after 40 seconds without starting ASGI lifespan; API startup NOT VERIFIED and port 8080 had no listener. Existing user task/Redis queues were not resumed.
+- GitHub push reported 135 dependency security alerts (8 critical, 68 high, 41 moderate, 18 low); not audited or fixed by this source sync.
+- Zero new spend; Actions disabled; no production deployment, SSH or force pushes.
+- Preserved three-day-old stale zero-byte .git/index.lock in chat archive instead of deleting; no active Git process was running.
+- Saved an incomplete setup environment under chat archive Preserved-Environments, no user environment lost.
+- Outstanding: investigate API import/startup timeout before claiming REST API operational; separately review dependency security alerts.
+
+- This is a source/environment upgrade, not a persistent API service launch.
