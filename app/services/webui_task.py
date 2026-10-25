@@ -1,3 +1,4 @@
+import copy
 import threading
 from collections import deque
 
@@ -10,7 +11,11 @@ from app.models.schema import VideoParams
 from app.services import state as sm
 from app.services import task as tm
 from app.services.loomloom import LoomLoomConfirmedVideoRequest
-from app.utils.logging_utils import format_log_record, log_scope_thread_id
+from app.utils.logging_utils import (
+    format_log_record,
+    log_scope_thread_id,
+    runtime_log_filter,
+)
 
 
 # WebUI 的配置保存在进程级全局字典中。原来的同步实现会在完整生成期间持有
@@ -75,11 +80,12 @@ def _run_generation(
         if capture_logs:
             log_handler_id = logger.add(
                 lambda message: _append_task_log(task_id, str(message)),
-                level="DEBUG",
+                level=0,
                 format=format_log_record,
                 colorize=False,
                 filter=lambda record: (
                     log_scope_thread_id(record["thread"].id) == worker_thread_id
+                    and runtime_log_filter(record)
                 ),
             )
 
@@ -146,9 +152,9 @@ def submit_generation(
     浏览器刷新或 WebSocket 重连也不依赖旧页面内存中的占位符。
     """
     task_params = params.model_copy(deep=True)
-    # 预览载荷只包含不可变音频路径、参数快照和只读字幕时间轴。复制外层字典，
-    # 避免页面后续 rerun 替换缓存字段时影响已经提交到后台队列的任务。
-    voice_preview_snapshot = dict(voice_preview) if voice_preview else None
+    # The subtitle timeline and nested preview parameters remain mutable in
+    # Streamlit session state. Snapshot them before this job enters the queue.
+    voice_preview_snapshot = copy.deepcopy(voice_preview) if voice_preview else None
     # Reference audio belongs only to this queued request. It is deliberately
     # separate from VideoParams so it cannot reach task history, presets, state
     # persistence, or logs. ``bytes`` is immutable; make an explicit snapshot

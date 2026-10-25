@@ -3,6 +3,7 @@ import math
 import os
 import re
 import socket
+import tempfile
 import threading
 import time
 from concurrent.futures import CancelledError, Future, ThreadPoolExecutor
@@ -18,6 +19,7 @@ from app.models.schema import VideoConcatMode, VideoParams
 from app.services import bgm as bgm_service
 from app.services import (
     elevenlabs_music,
+    infistar_video,
     llm,
     loomloom,
     material,
@@ -59,6 +61,8 @@ _ACTIVE_CROSS_POST_STATES = {
 }
 _CROSS_POST_STATE_WRITE_ATTEMPTS = 3
 _CROSS_POST_STATE_RETRY_DELAY_SECONDS = 0.1
+_TASK_FAILURE_STATE_WRITE_ATTEMPTS = 3
+_TASK_FAILURE_STATE_RETRY_DELAY_SECONDS = 0.1
 _LOOMLOOM_STATE_WRITE_ATTEMPTS = 3
 _LOOMLOOM_STATE_RETRY_DELAY_SECONDS = 0.1
 _INTERRUPTED_CROSS_POST_ERROR = (
@@ -91,6 +95,13 @@ _VIDEO_MUSIC_PROVIDERS = {
 }
 
 
+_SUPPORTED_VIDEO_SOURCES = frozenset({
+    "pexels", "pixabay", "coverr", "local", "wavespeed",
+    "volcengine_seedance", "ofox", "metaso_minimax", "muapi",
+    "loomloom", "openai_image", "infistar",
+})
+
+
 def _get_video_music_prompt(params: VideoParams) -> str:
     """
     读取当前视频配乐供应商实际使用的提示词。
@@ -113,7 +124,13 @@ def is_task_busy(task: dict | None) -> bool:
     try:
         state = int(state)
     except (TypeError, ValueError):
-        pass
+        # The function's own docstring promises to treat unparseable
+        # states as busy, so the delete API keeps a task that we
+        # cannot reason about. Returning False here would let
+        # delete_video() cancel a task that is still running or
+        # cross-posting whenever an older Redis snapshot or a
+        # legacy call site stored the state as a string.
+        return True
 
     # 视频生成和跨平台发布都可能继续读取任务目录。统一视为忙碌状态，
     # 可以避免 API 与 WebUI 分别维护规则后出现一个允许删除、另一个禁止
@@ -275,18 +292,37 @@ def _mark_task_failed(
     }
     # 某些外部任务已经创建了可用于恢复或排障的远端 ID。失败状态需要保留
     # 这些非敏感字段，但不能允许调用方覆盖统一的状态、进度和错误结构。
+    # Keep completed batch outputs in both the persisted state and the direct
+    # return value used by the CLI. These fields are reset before a new attempt.
     failure_details = {
-        key: value for key, value in dict(details or {}).items() if key not in failure
+        key: existing_task[key]
+        for key in ("videos", "combined_videos", "warnings", "failed_video_index")
+        if existing_task and key in existing_task
     }
+    failure_details.update({
+        key: value for key, value in dict(details or {}).items() if key not in failure
+    })
     failure.update(failure_details)
-    sm.state.update_task(
-        task_id,
-        state=failure["state"],
-        progress=failure["progress"],
-        failed_stage=failure["failed_stage"],
-        error=failure["error"],
-        **failure_details,
-    )
+    fields = {key: value for key, value in failure.items() if key != "task_id"}
+    for attempt in range(_TASK_FAILURE_STATE_WRITE_ATTEMPTS):
+        try:
+            if attempt == 0:
+                sm.state.update_task(task_id, **fields)
+            else:
+                # A lost acknowledgement may mean the first write succeeded.
+                # Patch only an existing record so retries cannot revive a task
+                # that the user has since deleted.
+                sm.state.patch_task(task_id, **fields)
+            break
+        except Exception as exc:
+            if attempt + 1 == _TASK_FAILURE_STATE_WRITE_ATTEMPTS:
+                logger.exception(
+                    f"failed to persist task failure, task_id: {task_id}, error: {exc}"
+                )
+            else:
+                time.sleep(_TASK_FAILURE_STATE_RETRY_DELAY_SECONDS)
+    # A state outage must not discard the only completed-file snapshot held by
+    # the caller. Return it even when all bounded persistence attempts fail.
     return failure
 
 
@@ -361,6 +397,9 @@ def generate_terms(task_id, params, video_script):
             video_terms = [term.strip() for term in video_terms]
         else:
             raise ValueError("video_terms must be a string or a list of strings.")
+
+        # Delimiter-only input must not reach paid reranking or material search.
+        video_terms = [term for term in video_terms if term]
 
         logger.debug(f"video terms: {utils.to_json(video_terms)}")
 
@@ -692,7 +731,9 @@ def get_video_materials(
     if params.video_source == "local":
         logger.info("\n\n## preprocess local materials")
         materials = video.preprocess_video(
-            materials=params.video_materials, clip_duration=params.video_clip_duration
+            materials=params.video_materials,
+            clip_duration=params.video_clip_duration,
+            image_motion=params.image_motion,
         )
         if not materials:
             _mark_task_failed(
@@ -781,6 +822,7 @@ def get_video_materials(
                 audio_duration=audio_duration * params.video_count,
                 max_clip_duration=params.video_clip_duration,
                 match_script_order=params.match_materials_to_script,
+                image_motion=params.image_motion,
                 # 素材阶段占用 40%~50%：每下完一个文件推进一次，慢速网络下
                 # 进度条不再长时间停在 40%。
                 progress_callback=_stage_progress_reporter(task_id, 40, 50),
@@ -845,6 +887,13 @@ def get_video_materials(
                 "materials",
                 str(exc),
                 details=details,
+            )
+            return None
+        except infistar_video.InfistarVideoError as exc:
+            remote_task_id = str(exc.task_id or "").strip()
+            _mark_task_failed(
+                task_id, "materials", str(exc),
+                details={"infistar_task_id": remote_task_id} if remote_task_id else None,
             )
             return None
         except muapi.MuAPIError as exc:
@@ -937,11 +986,20 @@ def _get_material_source_groups(task_id: str, video_paths: list[str]) -> dict[st
 
 
 def generate_final_videos(
-    task_id, params, downloaded_videos, audio_file, subtitle_path, audio_duration
+    task_id, params, downloaded_videos, audio_file, subtitle_path, audio_duration,
+    *, partial_results: dict | None = None,
 ):
+    """Record completed outputs even if a later clip raises before returning."""
     final_video_paths = []
     combined_video_paths = []
     warnings = []
+    if partial_results is not None:
+        # The caller owns this snapshot so it can report completed files even
+        # when the state backend fails during a progress/checkpoint write.
+        partial_results.update(
+            videos=final_video_paths, combined_videos=combined_video_paths,
+            warnings=warnings,
+        )
     allocate_batch_materials = params.video_count > 1 and params.video_source in {
         "pexels", "pixabay", "coverr", "local"
     }
@@ -970,6 +1028,8 @@ def generate_final_videos(
     _progress = 50
     for i in range(params.video_count):
         index = i + 1
+        if partial_results is not None:
+            partial_results["failed_video_index"] = index
         combined_video_path = path.join(
             utils.task_dir(task_id), f"combined-{index}.mp4"
         )
@@ -1082,11 +1142,13 @@ def generate_final_videos(
                 }
             )
 
-        _progress += 50 / params.video_count / 2
-        sm.state.update_task(task_id, progress=_progress)
-
         final_video_paths.append(final_video_path)
         combined_video_paths.append(combined_video_path)
+        _progress += 50 / params.video_count / 2
+        sm.state.update_task(
+            task_id, progress=_progress, videos=list(final_video_paths),
+            combined_videos=list(combined_video_paths), warnings=list(warnings) or None,
+        )
 
     return final_video_paths, combined_video_paths, warnings
 
@@ -1474,7 +1536,22 @@ def _run_pipeline(
     voxcpm_prompt_text: str = "",
 ):
     logger.info(f"start task: {task_id}, stop_at: {stop_at}")
-    sm.state.update_task(task_id, state=const.TASK_STATE_PROCESSING, progress=5)
+    sm.state.update_task(
+        task_id, state=const.TASK_STATE_PROCESSING, progress=5,
+        failed_stage=None, error=None,
+        videos=[], combined_videos=[], warnings=None, failed_video_index=None,
+    )
+
+    if stop_at == "video" and params.subtitle_enabled:
+        try:
+            video.validate_subtitle_colors(params)
+        except ValueError as exc:
+            return _mark_task_failed(task_id, "preflight", str(exc))
+
+    if stop_at in {"materials", "video"} and params.video_source not in _SUPPORTED_VIDEO_SOURCES:
+        return _mark_task_failed(
+            task_id, "preflight", f"unsupported video source: {params.video_source!r}"
+        )
 
     if (
         stop_at in {"materials", "video"}
@@ -1486,6 +1563,16 @@ def _run_pipeline(
             "preflight",
             "Volcano Engine Seedance requires an Ark API key",
         )
+
+    if stop_at in {"materials", "video"} and params.video_source == "infistar":
+        try:
+            if not infistar_video.is_enabled():
+                raise infistar_video.InfistarVideoError("Infistar video generation requires an API key")
+            infistar_video.model_id()
+            if params.video_aspect not in {"16:9", "9:16"}:
+                raise infistar_video.InfistarVideoError("Infistar video currently supports 16:9 and 9:16")
+        except infistar_video.InfistarVideoError as exc:
+            return _mark_task_failed(task_id, "preflight", str(exc))
 
     if (
         stop_at in {"materials", "video"}
@@ -1614,7 +1701,7 @@ def _run_pipeline(
 
     # 2. Generate terms
     video_terms = ""
-    if params.video_source != "local":
+    if stop_at in {"terms", "materials", "video"} and params.video_source != "local":
         video_terms = generate_terms(task_id, params, video_script)
         if not video_terms:
             return _mark_task_failed(
@@ -1659,6 +1746,26 @@ def _run_pipeline(
     sm.state.update_task(task_id, state=const.TASK_STATE_PROCESSING, progress=30)
 
     if stop_at == "audio":
+        # Full video jobs apply gain in the final mixer. Audio-only exports have
+        # no mixer, so apply it here to an owned output (never a custom input).
+        audio_volume = 1.0 if params.voice_volume is None else float(params.voice_volume)
+        if audio_volume != 1.0:
+            descriptor, output_file = tempfile.mkstemp(
+                prefix="audio-export-", suffix=".mp3", dir=utils.task_dir(task_id)
+            )
+            os.close(descriptor)
+            export_ready = False
+            try:
+                export_ready = voice.apply_audio_volume(audio_file, output_file, audio_volume)
+                if not export_ready:
+                    return _mark_task_failed(task_id, "audio", "failed to apply audio export volume")
+            finally:
+                if not export_ready:
+                    try:
+                        os.remove(output_file)
+                    except OSError as exc:
+                        logger.warning(f"failed to remove incomplete audio export: {exc}")
+            audio_file = output_file
         sm.state.update_task(
             task_id,
             state=const.TASK_STATE_COMPLETE,
@@ -1721,16 +1828,28 @@ def _run_pipeline(
         params.video_concat_mode = VideoConcatMode(params.video_concat_mode)
 
     # 6. Generate final videos
-    final_video_paths, combined_video_paths, generation_warnings = (
-        generate_final_videos(
+    partial_results = {}
+    try:
+        final_video_paths, combined_video_paths, generation_warnings = generate_final_videos(
             task_id,
             params,
             downloaded_videos,
             audio_file,
             subtitle_path,
             audio_duration,
+            partial_results=partial_results,
         )
-    )
+    except Exception as exc:
+        logger.exception(f"video batch failed, task_id: {task_id}, error: {exc}")
+        # Warnings for the failing clip do not describe any usable output.
+        completed_count = len(partial_results.get("videos", []))
+        partial_results["warnings"] = [
+            warning for warning in partial_results.get("warnings", [])
+            if warning.get("video_index", 0) <= completed_count
+        ] or None
+        return _mark_task_failed(
+            task_id, "video", f"{type(exc).__name__}: {exc}", details=partial_results,
+        )
 
     if not final_video_paths:
         return _mark_task_failed(

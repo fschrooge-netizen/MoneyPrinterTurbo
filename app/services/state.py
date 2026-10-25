@@ -11,7 +11,12 @@ from app.models import const
 
 
 _PATCH_EXISTING_TASK_SCRIPT = """
-if redis.call("EXISTS", KEYS[1]) == 0 then
+-- Match discovery/get_task ownership checks inside the same atomic operation.
+-- Other services and our queue may share this database or reuse a deleted key.
+if redis.call("TYPE", KEYS[1]).ok ~= "hash" then
+    return 0
+end
+if redis.call("HGET", KEYS[1], "task_id") ~= KEYS[1] then
     return 0
 end
 
@@ -20,6 +25,18 @@ for index = 1, #ARGV, 2 do
 end
 
 return 1
+"""
+
+
+_DELETE_OWNED_TASK_SCRIPT = """
+if redis.call("TYPE", KEYS[1]).ok ~= "hash" then
+    return 0
+end
+if redis.call("HGET", KEYS[1], "task_id") ~= KEYS[1] then
+    return 0
+end
+
+return redis.call("DEL", KEYS[1])
 """
 
 
@@ -89,7 +106,7 @@ class MemoryState(BaseState):
                 "task_id": task_id,
                 "state": state,
                 "progress": progress,
-                **kwargs,
+                **copy.deepcopy(kwargs),
             }
 
     def get_task(self, task_id: str):
@@ -224,7 +241,11 @@ class RedisState(BaseState):
             return None
 
         task = {
-            key.decode("utf-8"): self._convert_to_original_type(value)
+            key.decode("utf-8"): (
+                value.decode("utf-8")
+                if key == b"task_id"
+                else self._convert_to_original_type(value)
+            )
             for key, value in task_data.items()
         }
         return task
@@ -249,7 +270,9 @@ class RedisState(BaseState):
         return bool(updated)
 
     def delete_task(self, task_id: str):
-        self._redis.delete(task_id)
+        # 调用方读取任务后还会清理目录，同名键可能在这段时间被其它服务复用。
+        # 在一次 Lua 操作内检查类型、任务标记并删除，避免检查与删除之间的竞态。
+        self._redis.eval(_DELETE_OWNED_TASK_SCRIPT, 1, task_id)
 
     @staticmethod
     def _serialize_field(field, value):
